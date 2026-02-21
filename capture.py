@@ -105,7 +105,8 @@ async def alexa(request: Request):
         return JSONResponse(content={
             "version": "1.0",
             "response": {
-                "outputSpeech": {"type": "PlainText", "text": "What would you like to remember?"},
+                "outputSpeech": {"type": "PlainText", "text": "Say capture, then your thought."},
+                "reprompt": {"outputSpeech": {"type": "PlainText", "text": "Say capture, then what you want to save."}},
                 "shouldEndSession": False,
             },
         })
@@ -121,7 +122,8 @@ async def alexa(request: Request):
                 return JSONResponse(content={
                     "version": "1.0",
                     "response": {
-                        "outputSpeech": {"type": "PlainText", "text": "I didn't catch that. What would you like to remember?"},
+                        "outputSpeech": {"type": "PlainText", "text": "I didn't catch that. Say capture, then your thought."},
+                        "reprompt": {"outputSpeech": {"type": "PlainText", "text": "Say capture, then what you want to save."}},
                         "shouldEndSession": False,
                     },
                 })
@@ -150,7 +152,8 @@ async def alexa(request: Request):
             return JSONResponse(content={
                 "version": "1.0",
                 "response": {
-                    "outputSpeech": {"type": "PlainText", "text": "I didn't understand. Try saying: add, then your thought."},
+                    "outputSpeech": {"type": "PlainText", "text": "I didn't understand. Say capture, then your thought."},
+                    "reprompt": {"outputSpeech": {"type": "PlainText", "text": "Say capture, then what you want to save."}},
                     "shouldEndSession": False,
                 },
             })
@@ -160,7 +163,8 @@ async def alexa(request: Request):
         return JSONResponse(content={
             "version": "1.0",
             "response": {
-                "outputSpeech": {"type": "PlainText", "text": "I didn't catch that. Try saying add, then your thought."},
+                "outputSpeech": {"type": "PlainText", "text": "I didn't catch that. Say capture, then your thought."},
+                "reprompt": {"outputSpeech": {"type": "PlainText", "text": "Say capture, then what you want to save."}},
                 "shouldEndSession": False,
             },
         })

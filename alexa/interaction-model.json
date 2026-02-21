@@ -1,7 +1,7 @@
 {
   "interactionModel": {
     "languageModel": {
-      "invocationName": "brain box",
+      "invocationName": "mental note",
       "intents": [
         {
           "name": "CaptureSparkIntent",
