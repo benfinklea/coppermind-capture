@@ -1,0 +1,42 @@
+{
+  "interactionModel": {
+    "languageModel": {
+      "invocationName": "quick note",
+      "intents": [
+        {
+          "name": "CaptureSparkIntent",
+          "slots": [
+            {
+              "name": "spark_content",
+              "type": "AMAZON.SearchQuery"
+            }
+          ],
+          "samples": [
+            "remember {spark_content}",
+            "store {spark_content}",
+            "save {spark_content}",
+            "capture {spark_content}",
+            "note {spark_content}",
+            "spark {spark_content}",
+            "add {spark_content}",
+            "remember to {spark_content}",
+            "don't forget {spark_content}",
+            "note that {spark_content}"
+          ]
+        },
+        {
+          "name": "AMAZON.CancelIntent",
+          "samples": []
+        },
+        {
+          "name": "AMAZON.StopIntent",
+          "samples": []
+        },
+        {
+          "name": "AMAZON.HelpIntent",
+          "samples": []
+        }
+      ]
+    }
+  }
+}
