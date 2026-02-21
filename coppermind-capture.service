@@ -1,0 +1,15 @@
+[Unit]
+Description=Coppermind Capture API
+After=network.target postgresql.service redis.service
+
+[Service]
+Type=simple
+User=ben
+WorkingDirectory=/workspace/coppermind-capture
+EnvironmentFile=/workspace/coppermind-capture/.env
+ExecStart=/workspace/coppermind/.venv/bin/uvicorn capture:app --host 0.0.0.0 --port 8033
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
