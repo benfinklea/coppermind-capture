@@ -5,7 +5,8 @@ import sys
 from contextlib import asynccontextmanager
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 import logging
 
@@ -67,21 +68,108 @@ def store(spark: Spark, x_api_key: str = Header(default=None)):
     if spark.intensity not in VALID_INTENSITIES:
         raise HTTPException(status_code=400, detail=f"Invalid intensity. Use: {VALID_INTENSITIES}")
 
+    learning_id = _store_spark(spark.content, spark.source)
+    return {"id": learning_id, "stored": learning_id != "None"}
+
+
+def _store_spark(content: str, source: str) -> str:
+    """Shared storage logic for all capture sources."""
     learning_id = mem.learning.postgres_store.store_knowledge(
         agent_name=mem.agent_name,
-        category=spark.category,
-        content=spark.content,
-        source=spark.source,
+        category="fact",
+        content=content,
+        source=source,
         confidence=0.8,
-        learning_intensity=spark.intensity,
+        learning_intensity="routine",
         source_type="explicit_user",
         source_confidence=1.0,
         memory_type="spark",
-        metadata={"spark": True, "capture_source": spark.source},
+        metadata={"spark": True, "capture_source": source},
         skip_quality_gates=True,
     )
+    return str(learning_id)
 
-    return {"id": str(learning_id), "stored": learning_id is not None}
+
+@app.post("/alexa")
+async def alexa(request: Request):
+    """Alexa skill endpoint."""
+    body = await request.json()
+    request_type = body.get("request", {}).get("type", "")
+    logger.info(f"Alexa request_type={request_type}")
+    if request_type == "IntentRequest":
+        intent_name = body["request"]["intent"]["name"]
+        slots = body["request"]["intent"].get("slots", {})
+        logger.info(f"Alexa intent={intent_name} slots={slots}")
+
+    if request_type == "LaunchRequest":
+        return JSONResponse(content={
+            "version": "1.0",
+            "response": {
+                "outputSpeech": {"type": "PlainText", "text": "What would you like to remember?"},
+                "shouldEndSession": False,
+            },
+        })
+
+    if request_type == "IntentRequest":
+        intent = body["request"]["intent"]["name"]
+
+        if intent == "CaptureSparkIntent":
+            slots = body["request"]["intent"].get("slots", {})
+            content = slots.get("spark_content", {}).get("value", "")
+
+            if not content:
+                return JSONResponse(content={
+                    "version": "1.0",
+                    "response": {
+                        "outputSpeech": {"type": "PlainText", "text": "I didn't catch that. What would you like to remember?"},
+                        "shouldEndSession": False,
+                    },
+                })
+
+            logger.info(f"Alexa spark: {content[:50]}...")
+            learning_id = _store_spark(content, "alexa")
+
+            return JSONResponse(content={
+                "version": "1.0",
+                "response": {
+                    "outputSpeech": {"type": "PlainText", "text": "Stored."},
+                    "shouldEndSession": True,
+                },
+            })
+
+        if intent in ("AMAZON.CancelIntent", "AMAZON.StopIntent"):
+            return JSONResponse(content={
+                "version": "1.0",
+                "response": {
+                    "outputSpeech": {"type": "PlainText", "text": "Goodbye."},
+                    "shouldEndSession": True,
+                },
+            })
+
+        if intent == "AMAZON.FallbackIntent":
+            return JSONResponse(content={
+                "version": "1.0",
+                "response": {
+                    "outputSpeech": {"type": "PlainText", "text": "I didn't understand. Try saying: add, then your thought."},
+                    "shouldEndSession": False,
+                },
+            })
+
+        # Any other intent — log it so we can debug
+        logger.info(f"Alexa unhandled intent: {intent_name}")
+        return JSONResponse(content={
+            "version": "1.0",
+            "response": {
+                "outputSpeech": {"type": "PlainText", "text": "I didn't catch that. Try saying add, then your thought."},
+                "shouldEndSession": False,
+            },
+        })
+
+    # SessionEndedRequest or unknown
+    return JSONResponse(content={
+        "version": "1.0",
+        "response": {"shouldEndSession": True},
+    })
 
 
 @app.get("/health")
