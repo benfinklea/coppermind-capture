@@ -735,6 +735,44 @@ def _resolve_recipient_email(name: str, mem) -> Optional[dict]:
     return None
 
 
+def _resolve_recipient_phone(name: str, mem) -> Optional[dict]:
+    """Run a focused agent loop to resolve a name to a phone number or iMessage address."""
+    system_prompt = (
+        "You are resolving a contact's phone number or iMessage address. Use the available tools to "
+        "find the best phone number for the given person. When you have found it, "
+        'respond with ONLY a JSON object: {"phone": "+15551234567", "display_name": "Full Name"}. '
+        "If the contact has an iMessage email address, that works too. "
+        'If you cannot find a phone, respond with: {"phone": null, "display_name": null}'
+    )
+
+    user_message = f"Find the phone number or iMessage address for: {name}"
+    messages = [{"role": "user", "content": user_message}]
+
+    tools = ENRICHMENT_TOOLS_ANTHROPIC + [RESOLVE_CONTACT_TOOL_ANTHROPIC]
+
+    tool_executors = {
+        "search_memory": lambda args: _tool_search_memory(args["query"], mem),
+        "search_contacts": lambda args: _tool_search_contacts(args["query"]),
+        "search_web": lambda args: _tool_search_web(args["query"]),
+        "resolve_contact": lambda args: _tool_resolve_contact(
+            args["name"], args.get("contact_type", "phone"), mem
+        ),
+    }
+
+    try:
+        result = _run_agent_loop_haiku(
+            system_prompt, messages, tools, tool_executors,
+        )
+        if result:
+            parsed = _extract_json(result)
+            if parsed and parsed.get("phone"):
+                return parsed
+    except Exception as e:
+        logger.warning(f"Phone resolution failed: {e}")
+
+    return None
+
+
 def _send_email_via_mac(to_address: str, to_name: str, subject: str, body: str) -> bool:
     """SSH to ben.local and send an email via Mail.app helper script.
 
@@ -775,6 +813,48 @@ def _send_email_via_mac(to_address: str, to_name: str, subject: str, body: str) 
         return False
     except Exception as e:
         logger.warning(f"SSH email failed: {e}")
+        return False
+
+
+# SSH target + script for iMessage sending
+SEND_IMESSAGE_SCRIPT = os.environ.get("SEND_IMESSAGE_SCRIPT",
+                                       "/Users/benfinklea/bin/send_imessage.py")
+
+
+def _send_text_via_mac(recipient: str, text: str) -> bool:
+    """SSH to ben.local and send an iMessage via send_imessage.py."""
+    payload = {
+        "recipient": recipient,
+        "text": text,
+    }
+    json_bytes = json.dumps(payload).encode("utf-8")
+
+    try:
+        result = subprocess.run(
+            [
+                "ssh",
+                "-o", "ConnectTimeout=5",
+                "-o", "ServerAliveInterval=5",
+                "-o", "ServerAliveCountMax=2",
+                REMINDER_SSH_HOST,
+                "python3", SEND_IMESSAGE_SCRIPT,
+            ],
+            input=json_bytes,
+            capture_output=True,
+            timeout=15,
+        )
+        if result.returncode == 0:
+            logger.info(f"iMessage sent to {recipient}: {text[:80]}...")
+            return True
+        else:
+            stderr = result.stderr.decode("utf-8", errors="replace")
+            logger.warning(f"iMessage script failed: {stderr}")
+            return False
+    except subprocess.TimeoutExpired:
+        logger.warning("SSH iMessage timed out (Mac may be asleep)")
+        return False
+    except Exception as e:
+        logger.warning(f"SSH iMessage failed: {e}")
         return False
 
 
@@ -869,6 +949,84 @@ def _compose_and_send_email(content: str, classification, mem, learning_id: str)
     else:
         _update_metadata(mem, learning_id, {"action_status": "confirm_error"})
         logger.warning(f"email_confirm_error: id={learning_id} result={result}")
+
+
+def _compose_and_send_text(content: str, classification, mem, learning_id: str) -> None:
+    """Orchestrate the full text message (iMessage) action flow."""
+    from confirmation import confirm_action
+
+    recipient_name = classification.action_recipient
+    action_message = classification.action_message or content
+
+    _update_metadata(mem, learning_id, {"action_status": "resolving_contact"})
+    contact = _resolve_recipient_phone(recipient_name, mem)
+
+    if not contact or not contact.get("phone"):
+        logger.warning(f"Could not resolve phone for '{recipient_name}'")
+        _update_metadata(mem, learning_id, {
+            "action_status": "contact_not_found",
+            "action_recipient": recipient_name,
+        })
+        return
+
+    phone_or_email = contact["phone"]
+    display_name = contact.get("display_name", recipient_name)
+
+    _update_metadata(mem, learning_id, {
+        "action_status": "composing",
+        "action_resolved_phone": phone_or_email,
+        "action_resolved_name": display_name,
+    })
+
+    compose_prompt = (
+        f"Compose a brief text message from Ben to {display_name}.\n"
+        f"The message to convey: {action_message}\n"
+        f"Original voice transcript: \"{content}\"\n\n"
+        f'Respond with ONLY a JSON object: {{"text": "the message"}}\n'
+        f"Keep it short and natural, like a real text message. No greeting needed."
+    )
+    raw_text = _call_haiku(compose_prompt)
+    if not raw_text:
+        logger.warning("Text composition failed (Haiku unavailable)")
+        _update_metadata(mem, learning_id, {"action_status": "compose_failed"})
+        return
+
+    # Parse JSON response, fall back to raw text
+    parsed_text = _extract_json(raw_text)
+    if parsed_text and parsed_text.get("text"):
+        text_body = parsed_text["text"]
+    else:
+        text_body = raw_text.strip().strip('"').strip("'")
+
+    _update_metadata(mem, learning_id, {
+        "action_status": "confirming",
+        "action_message_body": text_body,
+    })
+
+    confirmation_details = f"To: {display_name} ({phone_or_email})\n\n{text_body}"
+    result = confirm_action(
+        summary=f"Send text to {display_name}?",
+        details=confirmation_details,
+    )
+
+    if result == "approved":
+        _update_metadata(mem, learning_id, {"action_status": "sending"})
+        sent = _send_text_via_mac(phone_or_email, text_body)
+        if sent:
+            _update_metadata(mem, learning_id, {"action_status": "sent"})
+            logger.info(f"text_sent: id={learning_id} to={phone_or_email}")
+        else:
+            _update_metadata(mem, learning_id, {"action_status": "send_failed"})
+            logger.warning(f"text_send_failed: id={learning_id}")
+    elif result == "rejected":
+        _update_metadata(mem, learning_id, {"action_status": "cancelled"})
+        logger.info(f"text_cancelled: id={learning_id}")
+    elif result == "timeout":
+        _update_metadata(mem, learning_id, {"action_status": "timeout"})
+        logger.info(f"text_timeout: id={learning_id}")
+    else:
+        _update_metadata(mem, learning_id, {"action_status": "confirm_error"})
+        logger.warning(f"text_confirm_error: id={learning_id} result={result}")
 
 
 def _run_agent_loop_haiku(system_prompt: str, messages: list,
@@ -1254,7 +1412,13 @@ def evaluate_and_update(learning_id: str, content: str, source: str, mem) -> Non
             except Exception as e:
                 logger.warning(f"Email action failed (non-fatal): id={learning_id} error={e}")
                 _update_metadata(mem, learning_id, {"action_status": "error"})
-        elif classification.action_type in ("send_text", "send_slack"):
+        elif classification.action_type == "send_text":
+            try:
+                _compose_and_send_text(content, classification, mem, learning_id)
+            except Exception as e:
+                logger.warning(f"Text action failed (non-fatal): id={learning_id} error={e}")
+                _update_metadata(mem, learning_id, {"action_status": "error"})
+        elif classification.action_type == "send_slack":
             _update_metadata(mem, learning_id, {"action_status": "not_implemented"})
             logger.info(f"action_not_implemented: id={learning_id} type={classification.action_type}")
         # Fall through to reminder creation regardless
@@ -1285,6 +1449,25 @@ def evaluate_and_update(learning_id: str, content: str, source: str, mem) -> Non
                     cur.close()
             except Exception:
                 pass  # Non-fatal — reminder still created
+        elif classification.action_type == "send_text":
+            try:
+                conn = mem.learning.postgres_store._get_conn()
+                cur = conn.cursor()
+                try:
+                    cur.execute(
+                        "SELECT metadata->>'action_status' FROM agent_knowledge WHERE id = %s",
+                        (learning_id,),
+                    )
+                    row = cur.fetchone()
+                    action_status = row[0] if row else None
+                    if action_status == "sent":
+                        reminder_body = f"[TEXT SENT]\n{reminder_body}".strip()
+                    elif action_status in ("cancelled", "timeout"):
+                        reminder_body = f"[TEXT {action_status.upper()} -- action needed]\n{reminder_body}".strip()
+                finally:
+                    cur.close()
+            except Exception:
+                pass
         success = _create_apple_reminder(
             title=classification.task_title,
             context=classification.context,

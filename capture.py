@@ -1,8 +1,9 @@
 """Coppermind Capture API — store sparks from anywhere."""
 
+import base64 as b64_module
 import hashlib
 import os
-from typing import Optional
+from typing import List, Optional
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -254,10 +255,19 @@ def health():
 # ── Hermes Messaging Endpoint ───────────────────────────────
 
 
+ALLOWED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
+
+
+class ImageData(BaseModel):
+    media_type: str
+    data: str
+
+
 class MessageRequest(BaseModel):
     content: str
     channel: str = "imessage"
     model_override: Optional[str] = None
+    images: Optional[List[ImageData]] = None
 
 
 class MessageResponse(BaseModel):
@@ -270,10 +280,55 @@ class MessageResponse(BaseModel):
 @app.post("/message", response_model=MessageResponse)
 def handle_message(req: MessageRequest, x_api_key: str = Header(default=None)):
     """Process an incoming message through Hermes and return a reply."""
-    logger.info(f"Hermes message: channel={req.channel} content={req.content[:80]}...")
+    logger.info(f"Hermes message: channel={req.channel} content={req.content[:80]}... images={len(req.images) if req.images else 0}")
     verify_key(x_api_key)
 
+    # Validate images if present
+    images = None
+    if req.images:
+        if len(req.images) > 5:
+            raise HTTPException(status_code=400, detail="Maximum 5 images per message")
+        validated = []
+        for img in req.images:
+            if img.media_type not in ALLOWED_IMAGE_TYPES:
+                raise HTTPException(status_code=400, detail=f"Unsupported image type: {img.media_type}. Allowed: {ALLOWED_IMAGE_TYPES}")
+            if len(img.data) > 5 * 1024 * 1024:
+                raise HTTPException(status_code=400, detail="Image base64 data exceeds 5MB limit")
+            try:
+                b64_module.b64decode(img.data, validate=True)
+            except Exception:
+                raise HTTPException(status_code=400, detail="Invalid base64 image data")
+            validated.append({"media_type": img.media_type, "data": img.data})
+        images = validated
+
     from hermes import process_message
-    result = process_message(req.content, req.channel, req.model_override, mem)
+    result = process_message(req.content, req.channel, req.model_override, mem, images=images)
 
     return MessageResponse(**result)
+
+
+SEND_ALLOWED_RECIPIENTS = {"coppermindvolacci@icloud.com"}
+
+
+class SendRequest(BaseModel):
+    recipient: str
+    text: str
+    source: str = "api"
+
+
+@app.post("/send")
+def send_message(req: SendRequest, x_api_key: str = Header(default=None)):
+    """Send a proactive iMessage to Ben via the Mac relay."""
+    logger.info(f"Proactive send: recipient={req.recipient} source={req.source} text={req.text[:80]}...")
+    verify_key(x_api_key)
+
+    if req.recipient not in SEND_ALLOWED_RECIPIENTS:
+        raise HTTPException(status_code=403, detail=f"Recipient not in allowlist")
+
+    from hermes import send_imessage_proactive
+    success = send_imessage_proactive(req.recipient, req.text)
+
+    if not success:
+        raise HTTPException(status_code=502, detail="Failed to send iMessage via Mac relay")
+
+    return {"sent": True, "recipient": req.recipient}

@@ -6,6 +6,7 @@ assembles memory context, calls Claude, and returns replies.
 
 import logging
 import os
+import json
 import re
 from datetime import datetime, date
 from typing import Optional, Tuple
@@ -19,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 MODELS = {
     "haiku": "claude-haiku-4-5-20251001",
-    "sonnet": "claude-sonnet-4-5-20250514",
+    "sonnet": "claude-sonnet-4-6",
     "opus": "claude-opus-4-6",
 }
 DEFAULT_MODEL = "haiku"
@@ -27,13 +28,18 @@ DEFAULT_MODEL = "haiku"
 # ── Budget config ────────────────────────────────────────────
 
 DAILY_BUDGET_USD = float(os.environ.get("HERMES_DAILY_BUDGET", "5.0"))
+
+# ── Proactive messaging config ───────────────────────────────
+
+PROACTIVE_SSH_HOST = os.environ.get("HERMES_SSH_HOST", "ben-mac")
+PROACTIVE_SEND_SCRIPT = os.environ.get("HERMES_SEND_SCRIPT", "/Users/benfinklea/bin/send_imessage.py")
 REDIS_HOST = os.environ.get("COPPERMIND_REDIS_HOST", "100.64.219.124")
 REDIS_PORT = 6379
 
 # Approximate cost per 1K tokens (input/output) for budget tracking
 MODEL_COSTS = {
     "claude-haiku-4-5-20251001": {"input": 0.001, "output": 0.005},
-    "claude-sonnet-4-5-20250514": {"input": 0.003, "output": 0.015},
+    "claude-sonnet-4-6": {"input": 0.003, "output": 0.015},
     "claude-opus-4-6": {"input": 0.015, "output": 0.075},
 }
 
@@ -72,13 +78,31 @@ def _get_anthropic() -> anthropic.Anthropic:
 # ── Public API ───────────────────────────────────────────────
 
 
-def process_message(content: str, channel: str, model_override: Optional[str], mem) -> dict:
+def process_message(content: str, channel: str, model_override: Optional[str], mem, images: list = None) -> dict:
     """Main entry point: process an incoming message and return a reply.
 
     Returns dict with: reply, model_used, cost_usd, intent
     """
     # 1. Parse model override from message prefix
-    model_key, content = _select_model(content, model_override)
+    model_key, content, model_explicit = _select_model(content, model_override)
+
+    # Auto-upgrade to Sonnet for image messages (only when using default model)
+    if images and model_key == "haiku" and not model_explicit:
+        model_key = "sonnet"
+        logger.info("Auto-upgraded to Sonnet for image message")
+
+    # Handle bare model command with no message text
+    if not content and not images:
+        _store_turn(mem, "user", f"/{model_key}")
+        reply = f"Switched to {model_key}. Send your next message."
+        _store_turn(mem, "assistant", reply)
+        return {
+            "reply": reply,
+            "model_used": model_key,
+            "cost_usd": 0.0,
+            "intent": "model_switch",
+        }
+
     model_id = MODELS[model_key]
 
     # 2. Detect slash commands (handled without Claude)
@@ -112,13 +136,18 @@ def process_message(content: str, channel: str, model_override: Optional[str], m
     system_prompt = _build_system_prompt(context_str, channel)
 
     # 6. Call Claude
-    reply, cost_usd = _call_claude(content, system_prompt, model_id, history)
+    reply, cost_usd = _call_claude(content, system_prompt, model_id, history, images=images)
 
     # 7. Record cost
     _record_cost(cost_usd, model_id)
 
-    # 8. Store both turns
-    _store_turn(mem, "user", content)
+    # 8. Store both turns (without base64 image data)
+    if images:
+        n = len(images)
+        store_content = f"[Sent {n} image{'s' if n > 1 else ''}, no longer visible] {content}" if content else f"[Sent {n} image{'s' if n > 1 else ''}, no longer visible]"
+    else:
+        store_content = content
+    _store_turn(mem, "user", store_content)
     _store_turn(mem, "assistant", reply)
 
     return {
@@ -132,18 +161,19 @@ def process_message(content: str, channel: str, model_override: Optional[str], m
 # ── Internal functions ───────────────────────────────────────
 
 
-def _select_model(content: str, model_override: Optional[str] = None) -> Tuple[str, str]:
-    """Parse /haiku, /sonnet, /opus prefix from message. Returns (model_key, cleaned_content)."""
+def _select_model(content: str, model_override: Optional[str] = None) -> Tuple[str, str, bool]:
+    """Parse /haiku, /sonnet, /opus prefix from message. Returns (model_key, cleaned_content, was_explicit)."""
     if model_override and model_override in MODELS:
-        return model_override, content
+        return model_override, content, True
 
+    lower = content.lower()
     for key in MODELS:
         prefix = f"/{key}"
-        if content.lower().startswith(prefix):
+        if lower == prefix or lower.startswith(prefix + " "):
             cleaned = content[len(prefix):].strip()
-            return key, cleaned if cleaned else content
+            return key, cleaned, True
 
-    return DEFAULT_MODEL, content
+    return DEFAULT_MODEL, content, False
 
 
 def _detect_intent(content: str, mem) -> Tuple[Optional[str], Optional[str]]:
@@ -327,6 +357,9 @@ def _build_system_prompt(context: str, channel: str) -> str:
         "- Use the provided memories to give personalized, contextual answers.\n"
         "- If you don't know something and it's not in the memories, say so.\n"
         "- You can reference things from earlier in the conversation naturally.\n"
+        "- Messages in history prefixed with [Sent N image(s), no longer visible] mean the user previously sent images "
+        "that are no longer visible. If asked about prior images, note you can only see images "
+        "in the current message.\n"
         "- No emojis unless Ben uses them first.\n"
         "- For technical topics, be precise but not verbose.\n"
         f"- Current date: {date.today().isoformat()}\n"
@@ -349,12 +382,33 @@ def _build_system_prompt(context: str, channel: str) -> str:
     return base
 
 
-def _call_claude(message: str, system: str, model: str, history: list) -> Tuple[str, float]:
+def _call_claude(message: str, system: str, model: str, history: list, images: list = None) -> Tuple[str, float]:
     """Call Claude API and return (reply_text, cost_usd)."""
     client = _get_anthropic()
 
     messages = history.copy()
-    messages.append({"role": "user", "content": message})
+
+    # Build content blocks for the user message
+    if images:
+        content_blocks = []
+        for img in images:
+            content_blocks.append({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": img["media_type"],
+                    "data": img["data"],
+                },
+            })
+        # Add text block (default prompt if no text with image)
+        text = message.strip() if message else "What's in this image?"
+        content_blocks.append({"type": "text", "text": text})
+        messages.append({"role": "user", "content": content_blocks})
+    else:
+        messages.append({"role": "user", "content": message})
+
+    # Longer timeout for vision requests
+    timeout = 120.0 if images else 60.0
 
     try:
         response = client.messages.create(
@@ -362,6 +416,7 @@ def _call_claude(message: str, system: str, model: str, history: list) -> Tuple[
             max_tokens=1024,
             system=system,
             messages=messages,
+            timeout=timeout,
         )
 
         reply = response.content[0].text
@@ -435,3 +490,38 @@ def _record_cost(cost_usd: float, model: str):
         r.expire(model_key, 172800)
     except Exception as e:
         logger.warning(f"Failed to record cost: {e}")
+
+
+def send_imessage_proactive(recipient: str, text: str) -> bool:
+    """Send an iMessage proactively by SSH-ing to ben.local and piping to send_imessage.py."""
+    import subprocess
+
+    payload = json.dumps({"recipient": recipient, "text": text})
+
+    try:
+        result = subprocess.run(
+            [
+                "ssh",
+                "-o", "ConnectTimeout=5",
+                "-o", "ServerAliveInterval=5",
+                "-o", "ServerAliveCountMax=2",
+                PROACTIVE_SSH_HOST,
+                "python3", PROACTIVE_SEND_SCRIPT,
+            ],
+            input=payload.encode("utf-8"),
+            capture_output=True,
+            timeout=10,
+        )
+        if result.returncode == 0:
+            logger.info(f"Proactive iMessage sent to {recipient}: {text[:80]}...")
+            return True
+        else:
+            stderr = result.stderr.decode("utf-8", errors="replace")
+            logger.warning(f"Proactive iMessage failed: {stderr}")
+            return False
+    except subprocess.TimeoutExpired:
+        logger.warning("Proactive iMessage SSH timed out (Mac may be asleep)")
+        return False
+    except Exception as e:
+        logger.warning(f"Proactive iMessage failed: {e}")
+        return False
