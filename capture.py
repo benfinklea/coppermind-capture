@@ -3,6 +3,7 @@
 import base64 as b64_module
 import hashlib
 import os
+import time
 from typing import List, Optional
 import sys
 import threading
@@ -75,6 +76,26 @@ class Spark(BaseModel):
 def verify_key(x_api_key: str):
     if not x_api_key or x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
+
+
+def _check_server_rate_limit(r_client, key_prefix: str = "hermes:rate", limit: int = 30, window: int = 60):
+    """Redis sliding window rate limiter. Returns (allowed, retry_after_secs)."""
+    try:
+        import time as _time
+        now = _time.time()
+        bucket = f"{key_prefix}:{int(now // window)}"
+        pipe = r_client.pipeline()
+        pipe.incr(bucket)
+        pipe.expire(bucket, window * 2)
+        results = pipe.execute()
+        count = results[0]
+        if count > limit:
+            retry_after = window - (now % window)
+            return False, int(retry_after) + 1
+        return True, 0
+    except Exception as e:
+        logger.warning(f"Rate limit check failed (allowing): {e}")
+        return True, 0
 
 
 def _compute_content_hash(content: str) -> str:
@@ -282,6 +303,26 @@ def handle_message(req: MessageRequest, x_api_key: str = Header(default=None)):
     """Process an incoming message through Hermes and return a reply."""
     logger.info(f"Hermes message: channel={req.channel} content={req.content[:80]}... images={len(req.images) if req.images else 0}")
     verify_key(x_api_key)
+
+    # Server-side rate limiting
+    try:
+        from pathlib import Path
+        password = Path("~/.redis-password").expanduser().read_text().strip()
+        import redis
+        r_client = redis.Redis(
+            host=os.environ.get("COPPERMIND_REDIS_HOST", "100.64.219.124"),
+            port=6379, password=password, decode_responses=True,
+            socket_timeout=2, socket_connect_timeout=2,
+        )
+        allowed, retry_after = _check_server_rate_limit(r_client)
+        if not allowed:
+            return JSONResponse(
+                status_code=429,
+                content={"detail": "Rate limit exceeded"},
+                headers={"Retry-After": str(retry_after)},
+            )
+    except Exception as e:
+        logger.warning(f"Rate limit setup failed (allowing): {e}")
 
     # Validate images if present
     images = None
