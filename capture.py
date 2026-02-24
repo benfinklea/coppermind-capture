@@ -1,11 +1,15 @@
 """Coppermind Capture API — store sparks from anywhere."""
 
+import hashlib
 import os
+from typing import Optional
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 import logging
@@ -21,6 +25,8 @@ COPPERMIND_PATH = os.environ.get("COPPERMIND_PATH", "/workspace/coppermind")
 # Add Coppermind to import path
 sys.path.insert(0, COPPERMIND_PATH)
 
+from evaluator import evaluate_and_update, get_pending_sparks, prewarm_ollama
+
 mem = None
 
 
@@ -30,13 +36,27 @@ async def lifespan(app: FastAPI):
     from memory import PersonalMemory
 
     mem = PersonalMemory()
+
+    # Pre-warm Ollama (background thread so startup isn't blocked)
+    threading.Thread(target=prewarm_ollama, daemon=True).start()
+
+    # Startup sweep: re-evaluate pending sparks older than 2 minutes
+    # Use bounded pool to avoid overwhelming Ollama/DB with concurrent requests
+    pending = get_pending_sparks(mem, min_age_seconds=120)
+    if pending:
+        logger.info(f"Startup sweep: {len(pending)} pending sparks to evaluate")
+        pool = ThreadPoolExecutor(max_workers=3)
+        for spark in pending:
+            pool.submit(evaluate_and_update,
+                        spark["id"], spark["content"], spark["source"], mem)
+
     yield
 
 
 app = FastAPI(
     title="Coppermind Capture",
     description="Store sparks into your Coppermind from Alexa, Siri, or anywhere.",
-    version="0.1.0",
+    version="0.2.0",
     lifespan=lifespan,
 )
 
@@ -56,8 +76,15 @@ def verify_key(x_api_key: str):
         raise HTTPException(status_code=401, detail="Invalid API key")
 
 
+def _compute_content_hash(content: str) -> str:
+    """SHA-256 of normalized content for dedup."""
+    normalized = " ".join(content.strip().lower().split())
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
 @app.post("/store")
-def store(spark: Spark, x_api_key: str = Header(default=None)):
+def store(spark: Spark, background_tasks: BackgroundTasks,
+          x_api_key: str = Header(default=None)):
     """Store a spark in your Coppermind."""
     logger.info(f"Received spark: content={spark.content[:50]}... category={spark.category} source={spark.source}")
     verify_key(x_api_key)
@@ -69,11 +96,24 @@ def store(spark: Spark, x_api_key: str = Header(default=None)):
         raise HTTPException(status_code=400, detail=f"Invalid intensity. Use: {VALID_INTENSITIES}")
 
     learning_id = _store_spark(spark.content, spark.source)
+
+    # Queue background evaluation
+    if learning_id and learning_id != "None":
+        background_tasks.add_task(
+            evaluate_and_update, learning_id, spark.content, spark.source, mem
+        )
+
     return {"id": learning_id, "stored": learning_id != "None"}
 
 
 def _store_spark(content: str, source: str) -> str:
-    """Shared storage logic for all capture sources."""
+    """Shared storage logic for all capture sources.
+
+    Stores original transcript and content hash in metadata,
+    marks as unevaluated for background processing.
+    """
+    original_hash = _compute_content_hash(content)
+
     learning_id = mem.learning.postgres_store.store_knowledge(
         agent_name=mem.agent_name,
         category="fact",
@@ -84,14 +124,20 @@ def _store_spark(content: str, source: str) -> str:
         source_type="explicit_user",
         source_confidence=1.0,
         memory_type="spark",
-        metadata={"spark": True, "capture_source": source},
+        metadata={
+            "spark": True,
+            "capture_source": source,
+            "original_transcript": content,
+            "original_content_hash": original_hash,
+            "evaluated": False,
+        },
         skip_quality_gates=True,
     )
     return str(learning_id)
 
 
 @app.post("/alexa")
-async def alexa(request: Request):
+async def alexa(request: Request, background_tasks: BackgroundTasks):
     """Alexa skill endpoint."""
     body = await request.json()
     request_type = body.get("request", {}).get("type", "")
@@ -131,10 +177,18 @@ async def alexa(request: Request):
             logger.info(f"Alexa spark: {content[:50]}...")
             learning_id = _store_spark(content, "alexa")
 
+            # Queue background evaluation
+            if learning_id and learning_id != "None":
+                background_tasks.add_task(
+                    evaluate_and_update, learning_id, content, "alexa", mem
+                )
+
+            # Echo back the spark content
+            echo = content[:80]
             return JSONResponse(content={
                 "version": "1.0",
                 "response": {
-                    "outputSpeech": {"type": "PlainText", "text": "Stored."},
+                    "outputSpeech": {"type": "PlainText", "text": f"Got it. {echo}"},
                     "shouldEndSession": True,
                 },
             })
@@ -176,7 +230,50 @@ async def alexa(request: Request):
     })
 
 
+@app.post("/evaluate-pending")
+def evaluate_pending(background_tasks: BackgroundTasks,
+                     x_api_key: str = Header(default=None)):
+    """Admin endpoint: re-evaluate sparks that failed or were missed."""
+    verify_key(x_api_key)
+
+    pending = get_pending_sparks(mem, min_age_seconds=0)
+    for spark in pending:
+        background_tasks.add_task(
+            evaluate_and_update, spark["id"], spark["content"], spark["source"], mem
+        )
+
+    return {"queued": len(pending)}
+
+
 @app.get("/health")
 def health():
     """Health check."""
     return {"status": "ok"}
+
+
+# ── Hermes Messaging Endpoint ───────────────────────────────
+
+
+class MessageRequest(BaseModel):
+    content: str
+    channel: str = "imessage"
+    model_override: Optional[str] = None
+
+
+class MessageResponse(BaseModel):
+    reply: str
+    model_used: str
+    cost_usd: float
+    intent: Optional[str] = None
+
+
+@app.post("/message", response_model=MessageResponse)
+def handle_message(req: MessageRequest, x_api_key: str = Header(default=None)):
+    """Process an incoming message through Hermes and return a reply."""
+    logger.info(f"Hermes message: channel={req.channel} content={req.content[:80]}...")
+    verify_key(x_api_key)
+
+    from hermes import process_message
+    result = process_message(req.content, req.channel, req.model_override, mem)
+
+    return MessageResponse(**result)
