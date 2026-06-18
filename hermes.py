@@ -150,6 +150,10 @@ def process_message(content: str, channel: str, model_override: Optional[str], m
     _store_turn(mem, "user", store_content)
     _store_turn(mem, "assistant", reply)
 
+    # Cache image description as a memory
+    if images:
+        _cache_image_description(reply, mem)
+
     return {
         "reply": reply,
         "model_used": model_key,
@@ -283,6 +287,21 @@ def _detect_intent(content: str, mem) -> Tuple[Optional[str], Optional[str]]:
         except Exception as e:
             return "status", f"Status check failed: {e}"
 
+    # /clear — reset conversation history
+    if stripped.lower() == "/clear":
+        try:
+            conn = mem.learning.postgres_store._get_conn()
+            with conn.cursor() as cur:
+                cur.execute("""
+                    DELETE FROM conversation_context
+                    WHERE agent_name = %s AND project = 'hermes'
+                """, (mem.agent_name,))
+            conn.commit()
+            return "clear", "Conversation cleared. Starting fresh."
+        except Exception as e:
+            logger.error(f"Failed to clear conversation: {e}")
+            return "clear", f"Failed to clear: {e}"
+
     return None, None
 
 
@@ -376,6 +395,7 @@ def _build_system_prompt(context: str, channel: str) -> str:
         "/tasks — list tasks\n"
         "/task <title> — add a task\n"
         "/status — check budget and model info\n"
+        "/clear — reset conversation history\n"
         "/sonnet or /opus — use a more powerful model for this message\n"
     )
 
@@ -488,8 +508,40 @@ def _record_cost(cost_usd: float, model: str):
         model_key = f"hermes:cost:{today}:{model}"
         r.incrbyfloat(model_key, cost_usd)
         r.expire(model_key, 172800)
+
+        # Message count for daily summary
+        count_key = f"hermes:msg_count:{today}"
+        r.incr(count_key)
+        r.expire(count_key, 172800)
     except Exception as e:
         logger.warning(f"Failed to record cost: {e}")
+
+
+def _cache_image_description(reply, mem):
+    """Cache a brief description of an image Ben sent, as a memory ember."""
+    try:
+        desc = reply[:200].strip()
+        last_period = desc.rfind(". ")
+        if last_period > 50:
+            desc = desc[:last_period + 1]
+        today = date.today().isoformat()
+        content = f"Photo sent by Ben via iMessage on {today}. Contents: {desc}"
+        mem.learning.postgres_store.store_knowledge(
+            agent_name=mem.agent_name,
+            category="fact",
+            content=content,
+            source="hermes_vision",
+            confidence=0.8,
+            learning_intensity="routine",
+            source_type="observation",
+            source_confidence=0.9,
+            memory_type="spark",
+            metadata={"capture_source": "hermes_vision", "date": today},
+            skip_quality_gates=True,
+        )
+        logger.info(f"Cached image description: {content[:80]}...")
+    except Exception as e:
+        logger.warning(f"Failed to cache image description: {e}")
 
 
 def send_imessage_proactive(recipient: str, text: str) -> bool:
