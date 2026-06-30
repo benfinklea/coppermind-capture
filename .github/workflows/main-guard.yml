@@ -1,0 +1,14 @@
+name: main-guard
+
+on:
+  push:
+    branches: [master]
+
+permissions:
+  checks: read
+  contents: read
+
+jobs:
+  guard:
+    uses: armbrain-io/.github/.github/workflows/main-guard.yml@main
+    secrets: inherit
